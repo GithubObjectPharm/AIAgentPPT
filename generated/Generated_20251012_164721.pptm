@@ -1,0 +1,19 @@
+Sub AutoOpen()
+    ' Runs automatically when file opens
+    Call GenerateSlidesFromText("questions.txt")
+End Sub
+
+Sub GenerateSlidesFromText(fileName As String)
+    Dim f As Integer, lineText As String
+    Dim q As String, opt(1 To 4) As String, ans As String, exp As String
+    Dim i As Integer
+
+    f = FreeFile
+    Open ThisWorkbook.Path & "\" & fileName For Input As #f
+    Do Until EOF(f)
+        Line Input #f, lineText
+        ' parse your Q|A|ANS|EXP lines here
+        ' create new slides using your existing VBA CreateAnimatedSlide routine
+    Loop
+    Close #f
+End Sub

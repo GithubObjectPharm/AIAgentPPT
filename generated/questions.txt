@@ -1,0 +1,40 @@
+Q1|Which of the following tasks may only be performed by a pharmacist?
+A|A) Counting and labeling tablets
+A|B) Final verification of a filled prescription
+A|C) Stocking medication shelves
+A|D) Entering patient demographics
+ANS|B
+EXP|Only pharmacists perform the final accuracy check.
+
+Q2|A pharmacy technician notices a possible drug interaction while entering a prescription. What should they do?
+A|A) Change the prescription
+A|B) Ignore it if the patient used it before
+A|C) Alert the pharmacist immediately
+A|D) Call the prescriber directly
+ANS|C
+EXP|Techs cannot alter prescriptions; they must alert the pharmacist.
+
+Q3|What is the correct sequence in pharmacy workflow?
+A|A) Verification → Data entry → Prescription filling → Counseling
+A|B) Data entry → Prescription filling → Pharmacist verification → Counseling
+A|C) Prescription filling → Data entry → Counseling → Pharmacist verification
+A|D) Counseling → Prescription filling → Data entry → Pharmacist verification
+ANS|B
+EXP|Proper flow is entry → fill → pharmacist verify → counsel.
+
+Q4|Which law requires pharmacies to protect patient health information?
+A|A) DEA regulations
+A|B) HIPAA
+A|C) OBRA-90
+A|D) FDA guidelines
+ANS|B
+EXP|HIPAA protects patient health information.
+
+Q5|During medication reconciliation, the pharmacy technician’s role is to:
+A|A) Adjust therapy
+A|B) Record and organize the patient’s current medication list
+A|C) Recommend discontinuation
+A|D) Substitute a cheaper drug
+ANS|B
+EXP|Techs compile medication lists, not adjust therapy.
+

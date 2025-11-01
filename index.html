@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Template Generator Demo</title>
+  <style>
+    body {
+      background-color: #121212;
+      color: #e0e0e0;
+      font-family: 'Segoe UI', sans-serif;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      margin: 0;
+      font-weight: 600;
+      font-size: 1.1rem;
+    }
+
+    .container {
+      display: flex;
+      gap: 30px;
+      width: 95%;
+      max-width: 1600px;
+    }
+
+    .left-panel, .right-panel {
+      flex: 1;
+      background: #1e1e1e;
+      padding: 30px;
+      border-radius: 12px;
+      box-shadow: 0 0 25px rgba(0, 0, 0, 0.6);
+      display: flex;
+      flex-direction: column;
+    }
+
+    .template-showcase {
+      background: #2c2c2c;
+      border-radius: 10px;
+      height: 350px; /* Increased height */
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      margin-bottom: 20px;
+      font-size: 1.5rem;
+      font-weight: bold;
+      overflow: hidden;
+      flex-shrink: 0; /* Prevent shrinking */
+    }
+
+    .template-showcase img {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+    }
+
+    select {
+      width: 100%;
+      padding: 14px;
+      border-radius: 8px;
+      border: none;
+      background-color: #333;
+      color: #e0e0e0;
+      margin-bottom: 15px;
+      cursor: pointer;
+      font-size: 1.2rem;
+      font-weight: bold;
+      flex-shrink: 0; /* Prevent shrinking */
+    }
+
+    .file-upload-section {
+      margin-top: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 15px;
+    }
+
+    .file-name-display {
+      width: 100%;
+      background: #2c2c2c;
+      border-radius: 8px;
+      padding: 16px;
+      color: #bdbdbd;
+      font-size: 1.1rem;
+      font-weight: bold;
+      text-align: center;
+      border: 1px solid #444;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      box-sizing: border-box;
+      height: 60px; /* Fixed height */
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0; /* Prevent shrinking */
+    }
+
+    .file-upload {
+      background: #d32f2f;
+      border: 2px dashed #ff5c5c;
+      border-radius: 10px;
+      height: 80px;
+      width: 100%;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      color: white;
+      font-size: 1.3rem;
+      font-weight: bold;
+      text-align: center;
+      cursor: pointer;
+      transition: background 0.3s;
+      flex-shrink: 0; /* Prevent shrinking */
+    }
+
+    .file-upload.dragover {
+      background: #ff5c5c;
+    }
+
+    .output-area {
+      background: #2c2c2c;
+      border-radius: 10px;
+      height: 320px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      align-items: center;
+      position: relative;
+      flex-shrink: 0; /* Prevent shrinking */
+    }
+
+    .progress-bar-container {
+      width: 100%;
+      height: 14px;
+      background: #444;
+      border-radius: 6px;
+      overflow: hidden;
+      margin-bottom: 20px;
+    }
+
+    .progress-bar {
+      width: 0%;
+      height: 100%;
+      background-color: #1976d2;
+      transition: width 0.3s ease-in-out;
+    }
+
+    .download-btn {
+      width: 100%;
+      flex: 1;
+      padding: 20px;
+      border-radius: 10px;
+      border: none;
+      background-color: #388e3c;
+      color: white;
+      font-size: 1.2rem;
+      font-weight: bold;
+      cursor: pointer;
+      transition: background 0.3s;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+    }
+
+    .download-btn:hover {
+      background-color: #43a047;
+    }
+
+    .reset-btn, .generate-btn {
+      margin-bottom: 20px;
+      width: 100%;
+      padding: 30px;
+      border: none;
+      color: white;
+      font-size: 1.4rem;
+      font-weight: bold;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: background 0.3s;
+      flex-shrink: 0; /* Prevent shrinking */
+    }
+
+    .reset-btn {
+      background-color: #d32f2f;
+    }
+
+    .reset-btn:hover {
+      background-color: #ff4444;
+    }
+
+    .generate-btn {
+      background-color: #1976d2;
+    }
+
+    .generate-btn:hover {
+      background-color: #2196f3;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="left-panel">
+      <div class="template-section">
+        <div class="template-showcase" id="showcase">Selected template showcase</div>
+        <select id="templateSelect">
+          <option value="none">Select a template</option>
+          <option value="ppt">PowerPoint Generator</option>
+          <option value="pdf">PDF Generator</option>
+          <option value="vba">VBA Script Generator</option>
+        </select>
+      </div>
+      <div class="file-upload-section">
+        <div class="file-name-display" id="fileName">No file added</div>
+        <div class="file-upload" id="fileUpload">Add file or drag file here</div>
+      </div>
+    </div>
+
+    <div class="right-panel">
+      <button class="reset-btn" id="resetBtn">Reset</button>
+      <button class="generate-btn" id="generateBtn">Generate</button>
+      <div class="output-area" id="output">
+        <div class="progress-bar-container">
+          <div class="progress-bar" id="progressBar"></div>
+        </div>
+        <button class="download-btn" id="downloadBtn">Download Generated File</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const templateSelect = document.getElementById('templateSelect');
+  const showcase = document.getElementById('showcase');
+  const fileUpload = document.getElementById('fileUpload');
+  const fileNameDisplay = document.getElementById('fileName');
+  const progressBar = document.getElementById('progressBar');
+  const downloadBtn = document.getElementById('downloadBtn');
+  const generateBtn = document.getElementById('generateBtn');
+  const resetBtn = document.getElementById('resetBtn');
+
+  let uploadedFilename = null;
+
+  // Template selection
+  templateSelect.addEventListener('change', () => {
+    const selectedTemplate = templateSelect.value;
+    const selectedText = templateSelect.options[templateSelect.selectedIndex].text;
+    
+    // Clear previous content
+    showcase.innerHTML = '';
+    
+    if (selectedTemplate === 'vba') {
+      // Display VBA template image
+      const img = document.createElement('img');
+      img.src = 'VBATemplate1.png';
+      img.alt = 'VBA Template';
+      showcase.appendChild(img);
+    } else {
+      // Display text for other templates
+      showcase.textContent = `${selectedText} selected`;
+    }
+  });
+
+  // Handle file upload (drag + click)
+  fileUpload.addEventListener('click', async () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.txt,.pdf,.docx';
+    input.onchange = async () => {
+      const file = input.files[0];
+      await uploadFile(file);
+    };
+    input.click();
+  });
+
+  fileUpload.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    fileUpload.classList.add('dragover');
+  });
+
+  fileUpload.addEventListener('dragleave', () => {
+    fileUpload.classList.remove('dragover');
+  });
+
+  fileUpload.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    fileUpload.classList.remove('dragover');
+    const file = e.dataTransfer.files[0];
+    await uploadFile(file);
+  });
+
+  async function uploadFile(file) {
+    if (!file) return;
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const res = await fetch('/upload', {
+      method: 'POST',
+      body: formData
+    });
+
+    const data = await res.json();
+    if (data.filename) {
+      uploadedFilename = data.filename;
+      fileNameDisplay.textContent = `Uploaded: ${data.filename}`;
+      alert('✅ File uploaded successfully!');
+    } else {
+      alert('❌ Upload failed: ' + data.error);
+    }
+  }
+
+  // Handle Generate button
+  generateBtn.addEventListener('click', async () => {
+    if (!uploadedFilename) {
+      alert('Please upload a file first!');
+      return;
+    }
+
+    const template = templateSelect.value;
+    if (template === 'none') {
+      alert('Please select a template!');
+      return;
+    }
+
+    progressBar.style.width = '0%';
+    let progress = 0;
+    const interval = setInterval(() => {
+      if (progress >= 100) clearInterval(interval);
+      else {
+        progress += 10;
+        progressBar.style.width = progress + '%';
+      }
+    }, 200);
+
+    const res = await fetch('/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        filename: uploadedFilename,
+        template: template
+      })
+    });
+
+    const data = await res.json();
+    clearInterval(interval);
+    progressBar.style.width = '100%';
+
+    if (data.download_url) {
+      alert('✅ File generated successfully!');
+      downloadBtn.dataset.url = data.download_url;
+    } else {
+      alert('❌ Generation failed: ' + data.error);
+    }
+  });
+
+  // Handle Download button
+  downloadBtn.addEventListener('click', () => {
+    if (downloadBtn.dataset.url) {
+      window.location.href = downloadBtn.dataset.url;
+    } else {
+      alert('No file generated yet.');
+    }
+  });
+
+  // Reset
+  resetBtn.addEventListener('click', () => {
+    progressBar.style.width = '0%';
+    showcase.innerHTML = 'Selected template showcase';
+    fileNameDisplay.textContent = 'No file added';
+    templateSelect.value = 'none';
+    uploadedFilename = null;
+    downloadBtn.dataset.url = '';
+    alert('Reset complete!');
+  });
+</script>
+
+</body>
+</html>
