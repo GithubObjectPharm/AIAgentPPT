@@ -1,4 +1,8 @@
-Flask
-openai
+flask
 python-dotenv
+openai
+python-docx
+PyPDF2
+python-pptx
+gunicorn
 werkzeug
