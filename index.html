@@ -1,4 +1,5 @@
 <!DOCTYPE html>
+<!-- Proofreading fixed v3: frontend never blocks proofread DOCX; backend verifies the real Word package and preserves Word runs. -->
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -1436,6 +1437,7 @@ button:disabled { opacity: .55; cursor: not-allowed; transform: none; }
           <button class="nav-item" type="button" data-template-shortcut="cbt_parser"><span class="nav-icon">◇</span>CBT Parser</button>
           <button class="nav-item" type="button" data-template-shortcut="docx_to_html"><span class="nav-icon">⌘</span>DOCX → HTML</button>
           <button class="nav-item" type="button" data-template-shortcut="chapter_translate"><span class="nav-icon">文</span>Word Chapter EN → FR</button>
+          <button class="nav-item" type="button" data-template-shortcut="proofreading"><span class="nav-icon">✓</span>Proofreading</button>
         </div>
       </div>
 
@@ -1497,6 +1499,7 @@ button:disabled { opacity: .55; cursor: not-allowed; transform: none; }
             <option value="cbt_parser">CBT Parser</option>
             <option value="docx_to_html">DOCX → HTML</option>
             <option value="chapter_translate">Word Chapter EN → FR</option>
+            <option value="proofreading">Proofreading</option>
           </select>
           <p class="task-help"></p>
 
@@ -1765,10 +1768,15 @@ End Sub
 let cachedHtmlText = null;
   let uploadedFilename = null;
   let uploadedMeta = '';
+  let uploadedExtension = '';
   let documents = [];
   let notifications = [];
   let activeDownloadUrl = '';
   let favorites = [];
+
+  // Proofreading is verified by the backend using the real DOCX package,
+  // so the browser does not reject it based on MIME or filename guesses.
+  const BROWSER_DOCX_HINT_ONLY_TEMPLATES = new Set(['chapter_translate', 'docx_to_html']);
 
 function saveState() {
   localStorage.setItem('prepDocuments', JSON.stringify(documents));
@@ -1786,8 +1794,37 @@ function loadState() {
 }
 
   function templateLabel(value) {
-    const option = [...templateSelect.options].find(opt => opt.value === value);
+    const normalizedValue = normalizeTemplateValue(value);
+    const option = [...templateSelect.options].find(opt => opt.value === normalizedValue);
     return option ? option.textContent : 'Generated File';
+  }
+
+  function normalizeTemplateValue(value) {
+    let key = String(value || '').trim().toLowerCase();
+    key = key.replace(/[-\s]+/g, '_');
+
+    const aliases = {
+      grammar: 'proofreading',
+      grammar_check: 'proofreading',
+      grammarcheck: 'proofreading',
+      proofread: 'proofreading',
+      proof_reading: 'proofreading',
+      proofreading_check: 'proofreading'
+    };
+
+    return aliases[key] || key;
+  }
+
+  function getCleanFileExtension(name) {
+    const cleaned = String(name || '').trim().replace(/[\u200e\u200f\ufeff]/g, '');
+    const dotIndex = cleaned.lastIndexOf('.');
+    if (dotIndex < 0) return '';
+    return cleaned.slice(dotIndex + 1).trim().toLowerCase();
+  }
+
+  function isDocxUpload() {
+    const ext = uploadedExtension || getCleanFileExtension(uploadedFilename);
+    return ext === 'docx';
   }
 
   function defaultShowcaseMarkup() {
@@ -1965,6 +2002,7 @@ function renderFavoritesModal() {
     templateSelect.value = 'none';
     uploadedFilename = null;
     uploadedMeta = '';
+    uploadedExtension = '';
     activeDownloadUrl = '';
     output.innerHTML = defaultOutputInner();
     downloadBtn = document.getElementById('downloadBtn');
@@ -1973,7 +2011,7 @@ function renderFavoritesModal() {
   }
 
   templateSelect.addEventListener('change', () => {
-    const selected = templateSelect.value;
+    const selected = normalizeTemplateValue(templateSelect.value);
     showcase.innerHTML = defaultShowcaseMarkup();
     output.innerHTML = defaultOutputInner();
     downloadBtn = document.getElementById('downloadBtn');
@@ -2044,6 +2082,14 @@ if (selected === 'mcq_grader') {
         "</div>";
       return;
     }
+    if (selected === 'proofreading') {
+      document.getElementById('showcaseText').innerHTML =
+        "<div style='width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:30px;'>" +
+          "<div style='font-size:1.75rem;font-weight:900;margin-bottom:16px;color:#101828;'>Proofreading</div>" +
+          "<div style='font-size:1.05rem;font-weight:600;line-height:1.65;max-width:650px;color:#667085;'>Upload a Word .docx file and fix grammar, spelling, punctuation, and clarity while keeping formatting, images, fonts, colors, sizing, and placement 1:1.</div>" +
+        "</div>";
+      return;
+    }
   });
 
   const panelToast = document.getElementById('panelToast');
@@ -2078,7 +2124,7 @@ if (selected === 'mcq_grader') {
   fileUpload.addEventListener('click', async () => {
     const input = document.createElement('input');
     input.type = 'file';
-    input.accept = '.txt,.pdf,.docx';
+    input.accept = '.txt,.pdf,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document';
     input.onchange = async () => await uploadFile(input.files[0]);
     input.click();
   });
@@ -2089,33 +2135,46 @@ if (selected === 'mcq_grader') {
 
   async function uploadFile(file) {
     if (!file) return;
+
     const formData = new FormData();
-    formData.append('file', file);
-    const res = await fetch('/upload', { method: 'POST', body: formData });
-    const data = await res.json();
+    // Pass the original filename explicitly so Flask can read the real .docx extension.
+    formData.append('file', file, file.name || 'uploaded_file');
+
+    let data = {};
+    try {
+      const res = await fetch('/upload', { method: 'POST', body: formData });
+      data = await res.json();
+    } catch (err) {
+      data = { error: 'Upload failed. The server did not return a readable response.' };
+    }
+
     if (data.filename) {
       uploadedFilename = data.filename;
-      uploadedMeta = `${file.name.split('.').pop().toUpperCase()} • ${(file.size / 1024 / 1024).toFixed(1)} MB • Uploaded just now`;
+      uploadedExtension = data.detected_extension || getCleanFileExtension(data.filename) || getCleanFileExtension(file.name);
+      uploadedMeta = `${(uploadedExtension || 'FILE').toUpperCase()} • ${(file.size / 1024 / 1024).toFixed(1)} MB • Uploaded just now`;
       fileNameDisplay.textContent = data.filename;
       fileMeta.textContent = uploadedMeta;
       setProgress(8, 'File uploaded', 'Ready to generate when you choose an output type.');
-    
+
       if (!documents.some(doc => doc.name === data.filename)) {
         documents.unshift({
           name: data.filename,
           output: 'Not generated yet',
           time: 'Just now',
-          type: data.filename.toLowerCase().endsWith('.pdf') ? 'pdf' : 'word',
+          type: uploadedExtension === 'pdf' ? 'pdf' : 'word',
           downloadUrl: ''
         });
         renderDocumentsModal();
+        saveState();
       }
     } else {
       uploadedFilename = null;
+      uploadedExtension = '';
       fileNameDisplay.textContent = 'No file added';
       fileMeta.textContent = 'DOCX • PDF • TXT';
-      setProgress(0, 'Upload failed', 'Try uploading the file again.');
-      showToast(data.error || 'Upload failed');
+      const detail = data.received_filename ? `${data.error || 'Upload failed'} (${data.received_filename})` : (data.error || 'Upload failed');
+      setProgress(0, 'Upload failed', detail);
+      showToast(detail, 5500);
     }
   }
 
@@ -2247,9 +2306,19 @@ async function copyTextToClipboard(text) {
   return true;
 }
   generateBtn.addEventListener('click', async () => {
-    const template = templateSelect.value;
+    const template = normalizeTemplateValue(templateSelect.value);
     if (template === 'none') { showToast('Please select a template'); return; }
     if (template !== 'cbt' && !uploadedFilename) { showToast('Please upload a file first', 3500); return; }
+
+    // Do not reject Proofreading based on a browser-side guess.
+    // The backend verifies the actual DOCX package and preserves layout using the same run-level foundation as EN → FR.
+    if (BROWSER_DOCX_HINT_ONLY_TEMPLATES.has(template) && uploadedFilename && !isDocxUpload()) {
+      const ext = uploadedExtension || getCleanFileExtension(uploadedFilename) || 'unknown';
+      const message = `This tool needs a real .docx Word file. Detected: ${ext}.`;
+      setProgress(0, 'Invalid file for selected tool', message);
+      showToast(message, 5500);
+      return;
+    }
 
     if (template === 'mcq_grader') {
       setProgress(15, 'Loading questions', 'Estimated time left: 10 seconds');
@@ -2270,7 +2339,7 @@ async function copyTextToClipboard(text) {
     generateBtn.textContent = 'Generating...';
 
     let progress = 8;
-    const totalEstimate = template === 'chapter_translate' ? 55 : template === 'docx_to_html' ? 25 : 35;
+    const totalEstimate = (template === 'chapter_translate' || template === 'proofreading') ? 55 : template === 'docx_to_html' ? 25 : 35;
     const startedAt = Date.now();
     setProgress(progress, 'Preparing document', `Estimated time left: ${totalEstimate} seconds`);
 
@@ -2286,7 +2355,12 @@ async function copyTextToClipboard(text) {
       const res = await fetch('/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filename: uploadedFilename, template, cbt_topic: document.getElementById('cbtInputInside') ? document.getElementById('cbtInputInside').value : '' })
+        body: JSON.stringify({
+          filename: uploadedFilename,
+          template: template === 'proofreading' ? 'proofreading' : normalizeTemplateValue(template),
+          template_type: template === 'proofreading' ? 'proofreading' : normalizeTemplateValue(template),
+          cbt_topic: document.getElementById('cbtInputInside') ? document.getElementById('cbtInputInside').value : ''
+        })
       });
       const data = await res.json();
       clearInterval(interval);
@@ -2297,7 +2371,7 @@ async function copyTextToClipboard(text) {
         activeDownloadUrl = data.download_url;
         setProgress(100, 'Generation complete', 'Ready now.');
         setOutputStatus('Generated');
-        showToast(template === 'docx_to_html' ? 'HTML generated – click Download to copy' : 'File generated successfully – click Download', 0, true);
+        showToast(template === 'docx_to_html' ? 'HTML generated – click Download to copy' : template === 'proofreading' ? 'Proofreading complete – click Download' : 'File generated successfully – click Download', 0, true);
         addNotification('Generation complete', templateLabel(template) + ' finished successfully.');
         addDocument(uploadedFilename || 'Generated CBT File', templateLabel(template), data.download_url);
         downloadBtn.disabled = false;
@@ -2370,17 +2444,19 @@ if (template === 'docx_to_html') {
   };
 }
       } else {
-        setProgress(0, 'Generation failed', 'No download URL returned.');
+        const errorMessage = data.error || 'No download URL returned.';
+        setProgress(0, 'Generation failed', errorMessage);
         setOutputStatus('Failed');
-        showToast('Generation failed');
+        showToast(errorMessage, 5500);
       }
     } catch (error) {
       clearInterval(interval);
       generateBtn.disabled = false;
       generateBtn.textContent = '✣ Generate';
-      setProgress(0, 'Generation failed', 'Could not reach backend.');
+      const errorMessage = error && error.message ? error.message : 'Could not reach backend.';
+      setProgress(0, 'Generation failed', errorMessage);
       setOutputStatus('Failed');
-      showToast('Generation failed');
+      showToast(errorMessage, 5500);
     }
   });
 

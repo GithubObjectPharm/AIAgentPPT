@@ -3,9 +3,11 @@ from werkzeug.utils import secure_filename
 import subprocess
 import tempfile
 import shutil
+import zipfile
 from pathlib import Path
 import os
 import re
+import unicodedata
 from datetime import datetime
 from copy import deepcopy
 
@@ -77,6 +79,7 @@ Key fixes:
 
 import os
 import re
+import unicodedata
 from datetime import datetime
 
 import cv2
@@ -611,8 +614,214 @@ def translate_and_overlay_text(image_path: str, output_path: str, client=None):
  
     return True, f"Translated {len(translated_regions)} text region(s)"
 # ---------------- BASIC HELPERS ----------------
+def normalize_upload_name(filename: str) -> str:
+    """Normalize browser-provided filenames before checking extensions."""
+    cleaned = unicodedata.normalize("NFKC", str(filename or ""))
+    cleaned = (
+        cleaned.replace("\u200e", "")
+        .replace("\u200f", "")
+        .replace("\ufeff", "")
+        .replace("\x00", "")
+        .strip()
+        .strip('"')
+        .strip("'")
+    )
+    return cleaned
+
+
+def clean_extension(filename: str) -> str:
+    """Return a safe lowercase extension even if the browser sends hidden characters."""
+    cleaned = normalize_upload_name(filename)
+    if "." not in cleaned:
+        return ""
+    ext = cleaned.rsplit(".", 1)[-1].strip().lower()
+    return re.sub(r"[^a-z0-9]+", "", ext)
+
+
+def is_real_docx_file(path: str) -> bool:
+    """A real .docx is a ZIP package containing Word document parts."""
+    try:
+        if not zipfile.is_zipfile(path):
+            return False
+        with zipfile.ZipFile(path) as zf:
+            names = set(zf.namelist())
+            return "[Content_Types].xml" in names and "word/document.xml" in names
+    except Exception:
+        return False
+
+
+def looks_like_pdf_file(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return f.read(5) == b"%PDF-"
+    except Exception:
+        return False
+
+
+def looks_like_text_file(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            sample = f.read(4096)
+        if not sample:
+            return True
+        sample.decode("utf-8")
+        return True
+    except UnicodeDecodeError:
+        try:
+            sample.decode("latin-1")
+            return True
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
 def allowed_file(filename: str) -> bool:
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+    return clean_extension(filename) in ALLOWED_EXTENSIONS
+
+
+def detect_uploaded_extension(saved_path: str, original_ext: str, browser_mime: str) -> str:
+    """
+    Detect the real file type after saving.
+    This is the important fix: Proofreading and EN→FR now trust the real DOCX
+    package, not a fragile browser MIME/filename guess.
+    """
+    browser_mime = (browser_mime or "").lower()
+
+    if is_real_docx_file(saved_path):
+        return "docx"
+    if looks_like_pdf_file(saved_path):
+        return "pdf"
+    if original_ext == "txt" or browser_mime.startswith("text/") or looks_like_text_file(saved_path):
+        return "txt"
+
+    return original_ext if original_ext in ALLOWED_EXTENSIONS else ""
+
+
+def collect_docx_runs_preserving_layout(doc_obj):
+    """
+    Collect editable text runs from body, tables, headers, footers, and Word text boxes.
+    Images/drawings are skipped so formatting and placement remain untouched.
+    """
+    paragraphs = []
+    seen_paragraphs = set()
+
+    def add_paragraph(paragraph):
+        try:
+            key = id(paragraph._element)
+        except Exception:
+            key = id(paragraph)
+        if key not in seen_paragraphs and paragraph.text and paragraph.text.strip():
+            seen_paragraphs.add(key)
+            paragraphs.append(paragraph)
+
+    def collect_from_container(container):
+        for paragraph in getattr(container, "paragraphs", []):
+            add_paragraph(paragraph)
+        for table in getattr(container, "tables", []):
+            for row in table.rows:
+                for cell in row.cells:
+                    collect_from_container(cell)
+
+    collect_from_container(doc_obj)
+    for section in doc_obj.sections:
+        collect_from_container(section.header)
+        collect_from_container(section.footer)
+
+    try:
+        from docx.text.paragraph import Paragraph as _Paragraph
+        for txbx in doc_obj.element.xpath(".//*[local-name()='txbxContent']"):
+            for p_el in txbx.xpath(".//*[local-name()='p']"):
+                add_paragraph(_Paragraph(p_el, doc_obj))
+    except Exception as e:
+        print(f"Text box paragraph collection skipped: {e}")
+
+    runs = []
+    seen_runs = set()
+    for paragraph in paragraphs:
+        for run in paragraph.runs:
+            try:
+                run_key = id(run._element)
+            except Exception:
+                run_key = id(run)
+            if run_key in seen_runs:
+                continue
+            if not run.text or not run.text.strip():
+                continue
+            if run._element.xpath(".//*[local-name()='drawing']"):
+                continue
+            seen_runs.add(run_key)
+            runs.append(run)
+
+    return runs
+
+
+def collect_docx_paragraphs_preserving_layout(doc_obj):
+    """
+    Collect *paragraph objects* (not flattened runs) from body, tables, headers,
+    footers, and Word text boxes. Used by the proofreading pipeline so grammar
+    correction can be done with full-sentence context instead of on isolated,
+    disconnected run fragments.
+    """
+    paragraphs = []
+    seen_paragraphs = set()
+
+    def add_paragraph(paragraph):
+        try:
+            key = id(paragraph._element)
+        except Exception:
+            key = id(paragraph)
+        if key not in seen_paragraphs and paragraph.text and paragraph.text.strip():
+            seen_paragraphs.add(key)
+            paragraphs.append(paragraph)
+
+    def collect_from_container(container):
+        for paragraph in getattr(container, "paragraphs", []):
+            add_paragraph(paragraph)
+        for table in getattr(container, "tables", []):
+            for row in table.rows:
+                for cell in row.cells:
+                    collect_from_container(cell)
+
+    collect_from_container(doc_obj)
+    for section in doc_obj.sections:
+        collect_from_container(section.header)
+        collect_from_container(section.footer)
+
+    try:
+        from docx.text.paragraph import Paragraph as _Paragraph
+        for txbx in doc_obj.element.xpath(".//*[local-name()='txbxContent']"):
+            for p_el in txbx.xpath(".//*[local-name()='p']"):
+                add_paragraph(_Paragraph(p_el, doc_obj))
+    except Exception as e:
+        print(f"Text box paragraph collection skipped: {e}")
+
+    # De-dupe runs within each paragraph (defensive, mirrors run-collector logic)
+    usable_paragraphs = []
+    for paragraph in paragraphs:
+        runs = [
+            r for r in paragraph.runs
+            if r.text and r.text.strip() and not r._element.xpath(".//*[local-name()='drawing']")
+        ]
+        if runs:
+            usable_paragraphs.append(paragraph)
+
+    return usable_paragraphs
+
+
+def normalize_template_choice(value: str) -> str:
+    """Keep frontend/backend template keys in sync, including old cached values."""
+    key = str(value or "").strip().lower()
+    key = re.sub(r"[-\s]+", "_", key)
+    aliases = {
+        "grammar": "proofreading",
+        "grammar_check": "proofreading",
+        "grammarcheck": "proofreading",
+        "proofread": "proofreading",
+        "proof_reading": "proofreading",
+        "proofreading_check": "proofreading",
+    }
+    return aliases.get(key, key)
 
 
 def extract_text(filepath: str) -> str:
@@ -3223,6 +3432,230 @@ def translate_texts_to_french_batch(texts: list) -> list:
     return results
  
 
+def grammar_check_paragraph(paragraph_text: str) -> str:
+    """
+    Correct spelling, grammar, punctuation, spacing, and awkward wording for a
+    SINGLE full paragraph (real sentence context — not a disconnected run
+    fragment). This is what actually lets the model detect and fix typos,
+    missing spaces, double spaces, and grammar issues, because it can see
+    the whole sentence at once.
+    """
+    text = paragraph_text or ""
+    if not text.strip():
+        return text
+
+    system_prompt = (
+        "You are a meticulous proofreader. Correct ALL spelling mistakes, "
+        "grammar errors, punctuation errors, capitalization errors, and "
+        "spacing errors (missing spaces, double spaces, spaces before "
+        "punctuation) in the text the user gives you. "
+        "Do NOT translate. Do NOT summarize or shorten. Do NOT add new "
+        "facts or sentences. Preserve numbers, symbols, and terminology. "
+        "Preserve the original line breaks exactly as given. "
+        "Return ONLY the corrected text with no commentary, no quotation "
+        "marks, and no markdown."
+    )
+
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0,
+                timeout=30,
+            )
+            corrected = (response.choices[0].message.content or "").strip()
+            if corrected:
+                return corrected
+            return text
+        except Exception as e:
+            print(f"Paragraph grammar-check attempt {attempt + 1} failed: {e}")
+            time.sleep(1)
+
+    return text  # fallback: keep original if every retry failed
+
+
+def grammar_check_paragraphs_batch(paragraph_texts: list) -> list:
+    """
+    Correct spelling/grammar/punctuation/spacing for a batch of FULL
+    paragraphs at once (each paragraph keeps its own sentence context, unlike
+    isolated run fragments). Falls back to per-paragraph correction if the
+    batch response doesn't line up 1:1 with the input.
+    """
+    clean_texts = [t if t else "" for t in paragraph_texts]
+    if not any(t.strip() for t in clean_texts):
+        return clean_texts
+
+    joined = "\n---BLOCK-END---\n".join(clean_texts)
+
+    system_prompt = (
+        "You are a meticulous proofreader working through a Word document "
+        "one paragraph at a time. Each block below is one full paragraph. "
+        "For every block, correct ALL spelling mistakes, grammar errors, "
+        "punctuation errors, capitalization errors, and spacing errors "
+        "(missing spaces, double spaces, missing space after punctuation, "
+        "space before punctuation). "
+        "Do NOT translate. Do NOT summarize or shorten. Do NOT merge blocks "
+        "together. Do NOT add new facts or sentences. Preserve numbers, "
+        "symbols, and terminology. "
+        "Return exactly the same number of blocks, in the same order, each "
+        "separated EXACTLY by ---BLOCK-END--- and nothing else — no "
+        "commentary, no markdown, no extra separators."
+    )
+
+    for attempt in range(2):
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": joined},
+                ],
+                temperature=0,
+                timeout=45,
+            )
+            corrected = response.choices[0].message.content or joined
+            parts = [p.strip() for p in corrected.split("---BLOCK-END---")]
+            if len(parts) == len(clean_texts):
+                return parts
+            print(f"Grammar batch mismatch: expected {len(clean_texts)}, got {len(parts)}")
+            break
+        except Exception as e:
+            print(f"Batch grammar attempt {attempt + 1} failed: {e}")
+            if attempt == 0:
+                time.sleep(1)
+
+    # Per-paragraph fallback if the batch failed or separators didn't line up.
+    results = []
+    for text in clean_texts:
+        results.append(grammar_check_paragraph(text))
+    return results
+
+
+def _apply_corrected_text_to_paragraph_runs(paragraph, corrected_text: str):
+    """
+    Redistribute a corrected full-paragraph string back across the
+    paragraph's original runs, preserving each run's formatting (bold,
+    italic, color, font, etc.) as closely as possible.
+
+    Strategy: proportionally split the corrected text across the runs based
+    on each run's share of the ORIGINAL paragraph length. The final run
+    absorbs any leftover characters so no text is lost. If the paragraph has
+    only one usable run, the whole corrected text goes there directly (the
+    common case, and the simplest to get exactly right).
+    """
+    runs = [
+        r for r in paragraph.runs
+        if not r._element.xpath(".//*[local-name()='drawing']")
+    ]
+    # Only redistribute across runs that originally had visible text;
+    # empty/whitespace-only runs are left untouched.
+    text_runs = [r for r in runs if r.text and r.text.strip()]
+
+    if not text_runs:
+        return
+
+    if len(text_runs) == 1:
+        text_runs[0].text = corrected_text
+        return
+
+    original_lengths = [len(r.text) for r in text_runs]
+    total_original = sum(original_lengths) or 1
+    total_corrected = len(corrected_text)
+
+    pos = 0
+    for idx, run in enumerate(text_runs):
+        if idx == len(text_runs) - 1:
+            # Last run gets everything remaining so no characters are dropped.
+            run.text = corrected_text[pos:]
+            break
+        share = original_lengths[idx] / total_original
+        take = round(total_corrected * share)
+        run.text = corrected_text[pos:pos + take]
+        pos += take
+
+
+def grammar_check_texts_batch(texts: list) -> list:
+    """
+    Kept for backward compatibility with any other caller. NOTE: this
+    operates on isolated fragments and is why the old proofreading feature
+    silently returned unchanged text — isolated fragments give the model
+    no sentence context to detect errors in. The proofreading route below
+    no longer calls this; it uses grammar_check_paragraphs_batch +
+    _apply_corrected_text_to_paragraph_runs instead, which corrects whole
+    paragraphs and redistributes results back across runs.
+    """
+    import time as _time
+
+    clean_texts = [t if t else "" for t in texts]
+    if not any(t.strip() for t in clean_texts):
+        return clean_texts
+
+    joined = "\n---BLOCK-END---\n".join(clean_texts)
+
+    system_prompt = (
+        "You are a precise grammar editor for a Word document. "
+        "Correct spelling, grammar, punctuation, capitalization, and unclear wording. "
+        "Use the surrounding blocks as context, because each block is a small text run from the same document window. "
+        "Do NOT translate. Do NOT summarize. Do NOT add new facts. Do NOT change meaning. "
+        "Preserve numbers, equations, symbols, bullets, option labels, headings, and terminology. "
+        "Keep each block separated exactly with ---BLOCK-END---. "
+        "Return the same number of blocks in the same order."
+    )
+
+    for attempt in range(2):
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": joined},
+                ],
+                temperature=0,
+                timeout=45,
+            )
+            corrected = response.choices[0].message.content or joined
+            parts = [p.strip() for p in corrected.split("---BLOCK-END---")]
+            if len(parts) == len(clean_texts):
+                return parts
+            print(f"Grammar batch mismatch: expected {len(clean_texts)}, got {len(parts)}")
+            break
+        except Exception as e:
+            print(f"Batch grammar attempt {attempt + 1} failed: {e}")
+            if attempt == 0:
+                _time.sleep(1)
+
+    # Per-run fallback if a batch fails or the separator count is wrong.
+    results = []
+    for text in clean_texts:
+        if not text.strip():
+            results.append(text)
+            continue
+        try:
+            r = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Fix grammar, spelling, punctuation, and clarity only. "
+                            "Do not translate, summarize, or change meaning. Return only the corrected text."
+                        ),
+                    },
+                    {"role": "user", "content": text},
+                ],
+                temperature=0,
+                timeout=15,
+            )
+            results.append(r.choices[0].message.content.strip())
+        except Exception:
+            results.append(text)
+    return results
+
+
 def translate_docx_embedded_images(doc):
     return
     image_ext_map = {
@@ -3437,16 +3870,69 @@ def upload_file():
         return jsonify({"error": "No file uploaded"}), 400
 
     file = request.files["file"]
-    if file.filename == "":
+    original_name = normalize_upload_name(file.filename)
+    if not original_name:
         return jsonify({"error": "No file selected"}), 400
 
-    if file and allowed_file(file.filename):
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-        file.save(filepath)
-        return jsonify({"message": "✅ File uploaded successfully", "filename": filename})
+    browser_mime = (getattr(file, "mimetype", "") or "").lower()
+    original_ext = clean_extension(original_name)
 
-    return jsonify({"error": "Invalid file type"}), 400
+    # Save first, then inspect the real file bytes. This prevents valid DOCX files
+    # from being rejected because the browser sent a weak MIME like octet-stream.
+    upload_uid = uuid.uuid4().hex
+    temp_filename = secure_filename(f"incoming_{upload_uid}.upload")
+    temp_path = os.path.join(app.config["UPLOAD_FOLDER"], temp_filename)
+    file.save(temp_path)
+
+    detected_ext = detect_uploaded_extension(temp_path, original_ext, browser_mime)
+
+    if detected_ext not in ALLOWED_EXTENSIONS:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        return jsonify({
+            "error": "Invalid file type. Please upload a real .docx, .pdf, or .txt file.",
+            "received_filename": original_name,
+            "received_mime": browser_mime,
+            "detected_extension": detected_ext or "unknown",
+        }), 400
+
+    # If it is going through the DOCX tools, it must be a real Word package.
+    if detected_ext == "docx" and not is_real_docx_file(temp_path):
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        return jsonify({
+            "error": "Invalid Word file. Please upload a real .docx file, not .doc/.pages/PDF renamed as .docx.",
+            "received_filename": original_name,
+            "received_mime": browser_mime,
+            "detected_extension": detected_ext,
+        }), 400
+
+    base_name = original_name.rsplit(".", 1)[0] if "." in original_name else original_name
+    safe_base = secure_filename(base_name) or "uploaded_file"
+    filename = secure_filename(f"{safe_base}.{detected_ext}")
+    final_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+
+    # Avoid Windows rename issues when replacing an existing upload.
+    if os.path.exists(final_path):
+        try:
+            os.remove(final_path)
+        except OSError:
+            filename = secure_filename(f"{safe_base}_{upload_uid[:8]}.{detected_ext}")
+            final_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+
+    os.replace(temp_path, final_path)
+
+    return jsonify({
+        "message": "✅ File uploaded successfully",
+        "filename": filename,
+        "detected_extension": detected_ext,
+        "received_filename": original_name,
+        "received_mime": browser_mime,
+    })
 
 def find_binary(*names):
     for name in names:
@@ -3661,7 +4147,7 @@ def generate_output():
     try:
         data = request.get_json(silent=True) or request.form
         filename = data.get("filename")
-        template_choice = data.get("template")
+        template_choice = normalize_template_choice(data.get("template"))
         cbt_topic = (data.get("cbt_topic") or "").strip()
 
         if not template_choice:
@@ -3715,43 +4201,22 @@ Rules:
         # ── FILE-BASED MODES ───────────────────────────────────────────────
         if not filename:
             return jsonify({"error": "Missing filename"}), 400
+        filename = secure_filename(str(filename or ""))
         filepath = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-        if not os.path.exists(filepath):
-            return jsonify({"error": f"Uploaded file not found: {filepath}"}), 404
+        if not filename or not os.path.exists(filepath):
+            return jsonify({"error": "Uploaded file not found. Please upload the document again."}), 404
 
         # ── CHAPTER TRANSLATE ──────────────────────────────────────────────
         if template_choice == "chapter_translate":
-            ext = filename.rsplit(".", 1)[-1].lower()
-            if ext != "docx":
-                return jsonify({"error": "Chapter Translator only supports Word .docx files."}), 400
+            if not is_real_docx_file(filepath):
+                return jsonify({"error": "Chapter Translator only supports real Word .docx files."}), 400
             _set(10, "Reading document", "~45 seconds")
             output_filename = f"translated_chapter_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
             output_path = os.path.join(app.config["GENERATED_FOLDER"], output_filename)
 
-            # Patch translate_texts_to_french_batch to report progress
+            # Same editable-run foundation used by Proofreading.
             doc_obj = Document(filepath)
-            paragraphs = []
-            def _collect(container):
-                for p in container.paragraphs:
-                    if p.text.strip(): paragraphs.append(p)
-                for t in container.tables:
-                    for row in t.rows:
-                        for cell in row.cells: _collect(cell)
-            _collect(doc_obj)
-            for section in doc_obj.sections:
-                _collect(section.header); _collect(section.footer)
-            from docx.text.paragraph import Paragraph as _Para
-            for txbx in doc_obj.element.xpath(".//*[local-name()='txbxContent']"):
-                for p_el in txbx.xpath(".//*[local-name()='p']"):
-                    p = _Para(p_el, doc_obj)
-                    if p.text.strip(): paragraphs.append(p)
-
-            all_runs = []
-            for paragraph in paragraphs:
-                for run in paragraph.runs:
-                    if run.text and run.text.strip():
-                        if not run._element.xpath(".//*[local-name()='drawing']"):
-                            all_runs.append(run)
+            all_runs = collect_docx_runs_preserving_layout(doc_obj)
 
             batch_size = 35
             total_batches = max(1, (len(all_runs) + batch_size - 1) // batch_size)
@@ -3771,11 +4236,51 @@ Rules:
             _set(100, "Done", "Complete")
             return jsonify({"message": "✅ Word chapter translated to French", "download_url": f"/download/{output_filename}", "job_id": job_id})
 
+        # ── PROOFREADING — paragraph-level grammar/spelling/spacing fix ─────
+        # FIXED: the previous version ran grammar correction on isolated,
+        # disconnected run fragments (e.g. "Thsi ", "is ", "a ", "tset"), which
+        # gave GPT no sentence context, so it almost always echoed the
+        # fragments back unchanged. Now we correct each FULL paragraph (real
+        # sentence context) and redistribute the corrected text back across
+        # that paragraph's original runs, so bold/italic/color/font placement
+        # is preserved while spelling, grammar, and spacing actually get fixed.
+        if template_choice == "proofreading":
+            if not is_real_docx_file(filepath):
+                return jsonify({"error": "Proofreading only supports real Word .docx files so the layout, images, fonts, colors, sizing, and placement can stay 1:1."}), 400
+
+            _set(10, "Reading document", "~45 seconds")
+            output_filename = f"proofread_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+            output_path = os.path.join(app.config["GENERATED_FOLDER"], output_filename)
+
+            doc_obj = Document(filepath)
+            paragraphs = collect_docx_paragraphs_preserving_layout(doc_obj)
+
+            batch_size = 20  # full paragraphs are longer than single runs, so use a smaller batch
+            total_batches = max(1, (len(paragraphs) + batch_size - 1) // batch_size)
+
+            for batch_num, i in enumerate(range(0, len(paragraphs), batch_size)):
+                pct = 10 + int((batch_num / total_batches) * 78)
+                remaining_batches = total_batches - batch_num
+                eta_secs = remaining_batches * 4
+                _set(pct, f"Proofreading batch {batch_num + 1}/{total_batches}", f"~{eta_secs}s remaining")
+
+                batch = paragraphs[i:i + batch_size]
+                original_texts = [p.text for p in batch]
+                corrected_texts = grammar_check_paragraphs_batch(original_texts)
+
+                for paragraph, corrected in zip(batch, corrected_texts):
+                    _apply_corrected_text_to_paragraph_runs(paragraph, corrected)
+
+            _set(92, "Saving document", "~2 seconds")
+            # Images are intentionally left unchanged for exact visual preservation.
+            doc_obj.save(output_path)
+            _set(100, "Done", "Complete")
+            return jsonify({"message": "✅ Proofreading complete", "download_url": f"/download/{output_filename}", "job_id": job_id})
+
         # ── DOCX TO HTML ───────────────────────────────────────────────────
         if template_choice == "docx_to_html":
-            ext = filename.rsplit(".", 1)[-1].lower()
-            if ext != "docx":
-                return jsonify({"error": "HTML converter only supports .docx files"}), 400
+            if not is_real_docx_file(filepath):
+                return jsonify({"error": "HTML converter only supports real Word .docx files"}), 400
             _set(20, "Converting with LibreOffice", "~8 seconds")
             output_filename = f"converted_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
             output_path = os.path.join(app.config["GENERATED_FOLDER"], output_filename)
@@ -3891,7 +4396,7 @@ Rules:
         output_path = os.path.join(app.config["GENERATED_FOLDER"], output_filename)
         fn_map = {"vba": create_vba_template_presentation, "mcq2": create_mcq_generator2_exact, "mcq3": create_mcq_generator3_exact, "vba_mobile": create_vba_template_presentation_mobile, "ppt": create_ppt_template_presentation}
         if template_choice not in fn_map:
-            return jsonify({"error": "Invalid template type"}), 400
+            return jsonify({"error": f"Invalid template type: {template_choice}"}), 400
         success = fn_map[template_choice](mcqs, output_path)
         _set(100, "Done", "Complete")
         if success:
@@ -3945,4 +4450,6 @@ def progress_stream(job_id):
 if __name__ == "__main__":
     if not PPTX_AVAILABLE:
         print("WARNING: python-pptx is not installed. Please run: pip install python-pptx")
-    app.run(host="0.0.0.0", port=8502, debug=False, threaded=True)
+    # Respect PORT from AWS/nohup commands. Default avoids ports already in use.
+    port = int(os.getenv("PORT", "5050"))
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
