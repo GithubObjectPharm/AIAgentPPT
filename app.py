@@ -900,6 +900,69 @@ def parse_drug_brand_blocks(text: str):
     return drugs
 
 
+def parse_qalert_drug_info_blocks(text: str):
+    """
+    Parse QAlert teaching-slide input like:
+
+    1. Drug Name
+    A) Drug info point 1
+    B) Drug info point 2
+    C) Drug info point 3
+
+    Supports A) / A. / A- and multi-line continuation text without
+    changing the existing MCQ or Brand/Drug parsing logic.
+    """
+    text = normalize_whitespace(text or "")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    blocks = []
+    current = None
+    current_point_index = None
+
+    numbered_re = re.compile(r"^\s*(\d+)\s*[\.)]\s*(.+?)\s*$")
+    letter_re = re.compile(r"^\s*([A-Za-z])\s*[\.)\-:]\s*(.+?)\s*$")
+
+    def finish_current():
+        nonlocal current
+        if current and current.get("drug_name") and current.get("points"):
+            current["points"] = [p.strip() for p in current["points"] if p and p.strip()]
+            if current["points"]:
+                blocks.append(current)
+        current = None
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        numbered = numbered_re.match(line)
+        if numbered:
+            finish_current()
+            current = {"drug_name": numbered.group(2).strip(), "points": []}
+            current_point_index = None
+            continue
+
+        if current is None:
+            # Be forgiving if the first drug name arrives without a number.
+            current = {"drug_name": re.sub(r"^[\-•]+\s*", "", line).strip(), "points": []}
+            current_point_index = None
+            continue
+
+        lettered = letter_re.match(line)
+        if lettered:
+            current["points"].append(lettered.group(2).strip())
+            current_point_index = len(current["points"]) - 1
+            continue
+
+        # Continuation line for the previous A/B/C point.
+        if current_point_index is not None and current.get("points"):
+            current["points"][current_point_index] = (
+                current["points"][current_point_index].rstrip() + " " + line
+            ).strip()
+        elif line:
+            current["points"].append(re.sub(r"^[\-•]+\s*", "", line).strip())
+            current_point_index = len(current["points"]) - 1
+
+    finish_current()
+    return blocks
+
+
 # ---------------- MCQ NORMALIZATION / PARSING ----------------
 def build_mcq_normalization_prompt(raw_text: str) -> str:
     return f"""
@@ -3307,6 +3370,158 @@ def create_brand_template_presentation_mobile(drug_blocks, output_path):
         return False
 
 
+def _find_qalert_background_image():
+    """Find backgroundppt.jpg in the normal project image locations."""
+    candidates = [
+        os.path.join(app.static_folder or "static", "backgroundppt.jpg"),
+        os.path.join("static", "backgroundppt.jpg"),
+        os.path.join(app.config.get("IMAGES_FOLDER", "images"), "backgroundppt.jpg"),
+        "backgroundppt.jpg",
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def create_qalert_template_presentation(drug_blocks, output_path):
+    """
+    QAlert Template Generator
+    Creates one high-yield teaching PowerPoint slide per drug using:
+      - full-slide background image: backgroundppt.jpg
+      - large white drug title
+      - teal content panel with Drug Info Points and hyphen bullets
+    """
+    if not PPTX_AVAILABLE:
+        return False
+
+    try:
+        prs = Presentation()
+        prs.slide_width = Inches(13.333)
+        prs.slide_height = Inches(7.5)
+
+        WHITE = PptRGBColor(255, 255, 255)
+        TEAL = PptRGBColor(19, 145, 128)
+        BLACK = PptRGBColor(0, 0, 0)
+
+        bg_path = _find_qalert_background_image()
+
+        def clean_text(value):
+            value = "" if value is None else str(value)
+            value = value.replace("\x00", " ")
+            value = re.sub(r"\s+", " ", value).strip()
+            return value
+
+        def title_size(text):
+            n = len(clean_text(text))
+            if n > 80:
+                return Pt(31)
+            if n > 58:
+                return Pt(38)
+            if n > 38:
+                return Pt(46)
+            return Pt(54)
+
+        def info_size(points):
+            total = sum(len(clean_text(p)) for p in points)
+            count = len(points)
+            longest = max([len(clean_text(p)) for p in points] or [0])
+            if count > 8 or total > 900 or longest > 190:
+                return Pt(24)
+            if count > 6 or total > 650 or longest > 140:
+                return Pt(28)
+            if count > 4 or total > 420 or longest > 95:
+                return Pt(32)
+            return Pt(39)
+
+        for block in drug_blocks:
+            drug_name = clean_text(block.get("drug_name", ""))
+            points = [clean_text(p) for p in block.get("points", []) if clean_text(p)]
+            if not drug_name or not points:
+                continue
+
+            slide = prs.slides.add_slide(prs.slide_layouts[6])
+
+            if bg_path:
+                slide.shapes.add_picture(bg_path, 0, 0, width=prs.slide_width, height=prs.slide_height)
+            else:
+                bg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, prs.slide_height)
+                bg.fill.solid()
+                bg.fill.fore_color.rgb = BLACK
+                bg.line.fill.background()
+
+            title_box = slide.shapes.add_textbox(Inches(1.72), Inches(1.28), Inches(10.5), Inches(0.82))
+            title_tf = title_box.text_frame
+            title_tf.clear()
+            title_tf.word_wrap = True
+            title_tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+            title_tf.margin_left = Pt(0)
+            title_tf.margin_right = Pt(0)
+            title_tf.margin_top = Pt(0)
+            title_tf.margin_bottom = Pt(0)
+
+            title_p = title_tf.paragraphs[0]
+            title_p.text = drug_name
+            title_p.alignment = PP_ALIGN.LEFT
+            title_p.font.name = "Arial"
+            title_p.font.size = title_size(drug_name)
+            title_p.font.bold = False
+            title_p.font.color.rgb = WHITE
+
+            info_panel = slide.shapes.add_shape(
+                MSO_SHAPE.RECTANGLE,
+                Inches(0.92),
+                Inches(2.94),
+                Inches(7.22),
+                Inches(3.98),
+            )
+            info_panel.fill.solid()
+            info_panel.fill.fore_color.rgb = TEAL
+            info_panel.line.fill.background()
+
+            tf = info_panel.text_frame
+            tf.clear()
+            tf.word_wrap = True
+            tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+            tf.vertical_anchor = MSO_VERTICAL_ANCHOR.TOP
+            tf.margin_left = Inches(0.42)
+            tf.margin_right = Inches(0.32)
+            tf.margin_top = Inches(0.34)
+            tf.margin_bottom = Inches(0.24)
+
+            heading = tf.paragraphs[0]
+            heading.text = "Drug Info Points"
+            heading.alignment = PP_ALIGN.LEFT
+            heading.space_after = Pt(44)
+            heading.font.name = "Arial"
+            heading.font.size = Pt(41)
+            heading.font.bold = False
+            heading.font.color.rgb = WHITE
+
+            point_font = info_size(points)
+            for point in points:
+                p = tf.add_paragraph()
+                p.text = f"- {point}"
+                p.alignment = PP_ALIGN.LEFT
+                p.space_after = Pt(3)
+                p.font.name = "Arial"
+                p.font.size = point_font
+                p.font.bold = False
+                p.font.color.rgb = WHITE
+
+        if len(prs.slides) == 0:
+            return False
+
+        prs.save(output_path)
+        return True
+
+    except Exception as e:
+        import traceback
+        print(f"Error creating QAlert template presentation: {e}")
+        print(traceback.format_exc())
+        return False
+
+
 def create_ppt_template_presentation(mcqs, output_path):
     if not PPTX_AVAILABLE:
         return False
@@ -4342,6 +4557,21 @@ Rules:
             if success:
                 return jsonify({"message": "File generated successfully", "download_url": f"/download/{output_filename}", "job_id": job_id})
             return jsonify({"error": "Failed to generate file"}), 500
+
+        # ── QALERT DRUG INFO TEMPLATE ──────────────────────────────────────
+        if template_choice == "qalert_template":
+            _set(20, "Parsing QAlert drug info blocks", "~2 seconds")
+            drug_blocks = parse_qalert_drug_info_blocks(file_content)
+            if not drug_blocks:
+                return jsonify({"error": "No QAlert drug info blocks were found. Use: 1. Drug Name, then A) info point, B) info point, C) info point."}), 400
+            _set(60, "Building QAlert teaching presentation", "~5 seconds")
+            output_filename = f"qalert_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pptx"
+            output_path = os.path.join(app.config["GENERATED_FOLDER"], output_filename)
+            success = create_qalert_template_presentation(drug_blocks, output_path)
+            _set(100, "Done", "Complete")
+            if success:
+                return jsonify({"message": "✅ QAlert PowerPoint generated successfully", "download_url": f"/download/{output_filename}", "job_id": job_id})
+            return jsonify({"error": "Failed to generate QAlert PowerPoint. Make sure python-pptx is installed and backgroundppt.jpg is available."}), 500
 
         # ── MCQ EXTRACTION ─────────────────────────────────────────────────
         _set(15, "Normalizing MCQs with GPT", "~20 seconds")

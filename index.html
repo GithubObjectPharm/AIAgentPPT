@@ -1430,6 +1430,7 @@ button:disabled { opacity: .55; cursor: not-allowed; transform: none; }
           <button class="nav-item" type="button" data-template-shortcut="cbt"><span class="nav-icon">●</span>CBT Generator</button>
           <button class="nav-item" type="button" data-template-shortcut="vba"><span class="nav-icon">☷</span>MCQ Generator</button>
           <button class="nav-item" type="button" data-template-shortcut="mcq2"><span class="nav-icon">☷</span>MCQ Generator 2</button>
+          <button class="nav-item" type="button" data-template-shortcut="qalert_template"><span class="nav-icon">⚕</span>QAlert Template Generator</button>
           <button class="nav-item" type="button" data-template-shortcut="mcq3"><span class="nav-icon">☷</span>MCQ Generator 3</button>
           <button class="nav-item" type="button" data-template-shortcut="brand_template"><span class="nav-icon">♧</span>Brand/Drug Name Generator</button>
           <button class="nav-item" type="button" data-template-shortcut="brand_template_mobile"><span class="nav-icon">▣</span>Brand/Drug Name Mobile</button>
@@ -1492,6 +1493,7 @@ button:disabled { opacity: .55; cursor: not-allowed; transform: none; }
             <option value="cbt">CBT Generator</option>
             <option value="vba">MCQ Generator</option>
             <option value="mcq2">MCQ Generator 2</option>
+            <option value="qalert_template">QAlert Template Generator</option>
             <option value="mcq3">MCQ Generator 3</option>
             <option value="brand_template">Brand/Drug Name Generator</option>
             <option value="brand_template_mobile">Brand/Drug Name (Mobile)</option>
@@ -2033,6 +2035,17 @@ function renderFavoritesModal() {
       document.getElementById('showcaseText').innerHTML = "<img src='/static/mcq2.png' alt='MCQ Generator 2 preview'>";
       return;
     }
+    if (selected === 'qalert_template') {
+      document.getElementById('showcaseText').innerHTML =
+        "<div style='width:100%;height:100%;position:relative;overflow:hidden;border-radius:12px;background:#050508 url(/static/backgroundppt.jpg) center/cover no-repeat;text-align:left;'>" +
+          "<div style='position:absolute;left:12%;top:17%;font-size:clamp(2.2rem,5vw,4.3rem);font-weight:400;color:white;letter-spacing:.02em;'>Drug Name</div>" +
+          "<div style='position:absolute;left:6%;top:40%;width:54%;height:46%;background:#139180;color:white;padding:3.5% 4%;font-weight:400;'>" +
+            "<div style='font-size:clamp(1.5rem,3.1vw,3.2rem);margin-bottom:9%;'>Drug Info Points</div>" +
+            "<div style='font-size:clamp(1.25rem,2.7vw,2.9rem);line-height:1.22;'>- Drug info point 1<br>- Drug info point 2<br>- Drug info point 3</div>" +
+          "</div>" +
+        "</div>";
+      return;
+    }
     if (selected === 'mcq3') {
       document.getElementById('showcaseText').innerHTML = "<img src='/static/mcq3.png' alt='MCQ Generator 3 preview'>";
       return;
@@ -2465,8 +2478,8 @@ if (template === 'docx_to_html') {
     const selectedModel = modelSelect ? modelSelect.value : 'gpt-4.5';
     console.log('Animation model:', selectedModel);
     if (selected === 'vba') { await navigator.clipboard.writeText(MCQ_ANIMATION_CODE); showToast('MCQ Animation Code Copied', 3500); addNotification('Animation copied', 'MCQ animation code was copied to clipboard.'); return; }
-    if (selected === 'brand_template') { await navigator.clipboard.writeText(DRUG_ANIMATION_CODE); showToast('Drug Animation Code Copied', 3500); addNotification('Animation copied', 'Drug animation code was copied to clipboard.'); return; }
-    showToast('Select MCQ or Brand template to copy animation code', 3500);
+    if (selected === 'brand_template' || selected === 'qalert_template') { await navigator.clipboard.writeText(DRUG_ANIMATION_CODE); showToast('Drug Animation Code Copied', 3500); addNotification('Animation copied', 'Drug animation code was copied to clipboard.'); return; }
+    showToast('Select MCQ, QAlert, or Brand template to copy animation code', 3500);
   });
 
   newProjectBtn.addEventListener('click', resetProject);
