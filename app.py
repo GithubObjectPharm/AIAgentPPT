@@ -902,62 +902,174 @@ def parse_drug_brand_blocks(text: str):
 
 def parse_qalert_drug_info_blocks(text: str):
     """
-    Parse QAlert teaching-slide input like:
+    Parse QAlert teaching-slide input using GPT so it correctly understands
+    every real-world variation:
+      - Standard format: Drug Name / explanation lines / QAlerts / alert text
+      - No QAlerts section at all (drug only has teaching points)
+      - QAlerts present but empty/placeholder ("QAlerts" then nothing after it)
+      - Numbered/lettered legacy format (1. Drug  A) point  B) point)
+      - Multiple drugs pasted back to back with inconsistent spacing
+      - Typos/variants of "QAlerts" (Q Alert, QAlert!, Qalerts:, etc.)
 
-    1. Drug Name
-    A) Drug info point 1
-    B) Drug info point 2
-    C) Drug info point 3
+    Falls back to the original regex-based parser if the GPT call fails or
+    returns nothing usable, so the feature never hard-fails.
+    """
+    text = normalize_whitespace(text or "")
+    if not text.strip():
+        return []
 
-    Supports A) / A. / A- and multi-line continuation text without
-    changing the existing MCQ or Brand/Drug parsing logic.
+    system_prompt = (
+        "You are a strict data extractor for a pharmacy teaching-slide tool. "
+        "You will be given raw pasted text describing one or more drugs. "
+        "For EACH drug, extract:\n"
+        "  - drug_name: the drug's name only\n"
+        "  - points: a list of teaching bullet points/explanations about the drug "
+        "(mechanism, use, side effects, counseling points, etc.)\n"
+        "  - alerts: a list of QAlert warning lines for that drug. QAlerts may be "
+        "labeled 'QAlerts', 'QAlert', 'Q Alert', 'QAlerts!', 'Qalert:', or similar "
+        "typos/variants — treat all of these as the QAlerts marker.\n"
+        "IMPORTANT EDGE CASES:\n"
+        "  - If a drug has NO QAlerts section at all, return an empty list for alerts. "
+        "Do NOT invent an alert and do NOT drop the drug.\n"
+        "  - If the QAlerts marker appears but has no text after it, return an empty "
+        "list for alerts.\n"
+        "  - If a drug has teaching points but they are not clearly separated by line, "
+        "split them into logical, separate bullet points.\n"
+        "  - Never merge two different drugs into one entry.\n"
+        "  - Never fabricate a drug, point, or alert that isn't supported by the text.\n"
+        "Return ONLY valid JSON: a list of objects with keys drug_name, points, alerts. "
+        "No commentary, no markdown fences."
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+            temperature=0,
+            timeout=45,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+
+        import json as _json
+        parsed = _json.loads(raw)
+
+        blocks = []
+        for item in parsed:
+            drug_name = str(item.get("drug_name") or "").strip()
+            points = [str(p).strip() for p in (item.get("points") or []) if str(p).strip()]
+            alerts = [str(a).strip() for a in (item.get("alerts") or []) if str(a).strip()]
+            if not drug_name:
+                continue
+            # A drug with neither points nor alerts is not usable content.
+            if not points and not alerts:
+                continue
+            blocks.append({
+                "drug_name": drug_name,
+                "points": points,
+                "alerts": alerts,
+                "alert_title": "QAlerts",
+            })
+
+        if blocks:
+            return blocks
+
+    except Exception as e:
+        print(f"GPT QAlert parsing failed, falling back to regex parser: {e}")
+
+    return _parse_qalert_drug_info_blocks_regex_fallback(text)
+
+
+def _parse_qalert_drug_info_blocks_regex_fallback(text: str):
+    """
+    Original regex/heuristic parser, kept as a safety-net fallback for when
+    the GPT parsing call fails (e.g. network issue, malformed JSON, API
+    outage). Broadened slightly to also catch common QAlerts typos.
     """
     text = normalize_whitespace(text or "")
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return []
+
+    def clean_line(value):
+        value = re.sub(r"^[\-•]+\s*", "", str(value or "").strip())
+        value = re.sub(r"^\s*\d+\s*[\.)]\s*", "", value)
+        value = re.sub(r"^\s*[A-Za-z]\s*[\.)\-:]\s*", "", value)
+        return re.sub(r"\s+", " ", value).strip()
+
+    def is_qalerts_header(value):
+        # Broadened to catch common typos/variants ("Q Alert", "QAlert!", "Qalerts:")
+        return re.match(r"^q\s*-?\s*alerts?\s*!?\s*:?\s*$", str(value or "").strip(), flags=re.I) is not None
+
+    def is_drug_start(value):
+        value = str(value or "").strip()
+        if not value or is_qalerts_header(value):
+            return False
+        if re.match(r"^\s*\d+\s*[\.)]\s*\S+", value):
+            return True
+        return False
+
     blocks = []
     current = None
-    current_point_index = None
-
-    numbered_re = re.compile(r"^\s*(\d+)\s*[\.)]\s*(.+?)\s*$")
-    letter_re = re.compile(r"^\s*([A-Za-z])\s*[\.)\-:]\s*(.+?)\s*$")
+    section = "points"
 
     def finish_current():
         nonlocal current
-        if current and current.get("drug_name") and current.get("points"):
-            current["points"] = [p.strip() for p in current["points"] if p and p.strip()]
-            if current["points"]:
-                blocks.append(current)
+        if not current:
+            return
+        current["drug_name"] = clean_line(current.get("drug_name", ""))
+        current["points"] = [clean_line(p) for p in current.get("points", []) if clean_line(p)]
+        current["alerts"] = [clean_line(a) for a in current.get("alerts", []) if clean_line(a)]
+        current["alert_title"] = "QAlerts"
+        # A drug is usable with points OR alerts (or both) — no QAlerts is valid.
+        if current["drug_name"] and (current["points"] or current["alerts"]):
+            blocks.append(current)
         current = None
 
     for raw_line in lines:
         line = raw_line.strip()
-        numbered = numbered_re.match(line)
-        if numbered:
-            finish_current()
-            current = {"drug_name": numbered.group(2).strip(), "points": []}
-            current_point_index = None
+        if not line:
+            continue
+
+        if is_qalerts_header(line):
+            if current is None:
+                current = {"drug_name": "", "points": [], "alerts": [], "alert_title": "QAlerts"}
+            section = "alerts"
             continue
 
         if current is None:
-            # Be forgiving if the first drug name arrives without a number.
-            current = {"drug_name": re.sub(r"^[\-•]+\s*", "", line).strip(), "points": []}
-            current_point_index = None
+            current = {"drug_name": clean_line(line), "points": [], "alerts": [], "alert_title": "QAlerts"}
+            section = "points"
             continue
 
-        lettered = letter_re.match(line)
-        if lettered:
-            current["points"].append(lettered.group(2).strip())
-            current_point_index = len(current["points"]) - 1
+        # A numbered line after an existing complete block starts a new drug.
+        if is_drug_start(line) and (current.get("points") or current.get("alerts")):
+            finish_current()
+            current = {"drug_name": clean_line(line), "points": [], "alerts": [], "alert_title": "QAlerts"}
+            section = "points"
             continue
 
-        # Continuation line for the previous A/B/C point.
-        if current_point_index is not None and current.get("points"):
-            current["points"][current_point_index] = (
-                current["points"][current_point_index].rstrip() + " " + line
-            ).strip()
-        elif line:
-            current["points"].append(re.sub(r"^[\-•]+\s*", "", line).strip())
-            current_point_index = len(current["points"]) - 1
+        # If an unnumbered title appears after QAlerts text, treat it as the
+        # next drug title. This keeps multiple plain-format blocks usable.
+        if section == "alerts" and current.get("alerts") and not re.match(r"^[A-Za-z]\s*[\.)\-:]\s*", line):
+            if len(clean_line(line).split()) <= 8 and not line.endswith(('.', ';', ':')):
+                finish_current()
+                current = {"drug_name": clean_line(line), "points": [], "alerts": [], "alert_title": "QAlerts"}
+                section = "points"
+                continue
+
+        cleaned = clean_line(line)
+        if not cleaned:
+            continue
+        if section == "alerts":
+            current.setdefault("alerts", []).append(cleaned)
+        else:
+            current.setdefault("points", []).append(cleaned)
 
     finish_current()
     return blocks
@@ -2904,7 +3016,7 @@ def create_mcq_generator3_exact(mcqs, output_path):
         print(f"[MCQ3] FAILED: {e}", flush=True)
         print(traceback.format_exc(), flush=True)
         return False
-    
+   
 def create_vba_template_presentation_mobile(mcqs, output_path):
     if not PPTX_AVAILABLE:
         return False
@@ -3371,12 +3483,13 @@ def create_brand_template_presentation_mobile(drug_blocks, output_path):
 
 
 def _find_qalert_background_image():
-    """Find backgroundppt.jpg in the normal project image locations."""
+    """Find qalerts.jpg in /static first, then safe fallbacks."""
     candidates = [
+        os.path.join(app.static_folder or "static", "qalerts.jpg"),
+        os.path.join("static", "qalerts.jpg"),
+        "qalerts.jpg",
         os.path.join(app.static_folder or "static", "backgroundppt.jpg"),
         os.path.join("static", "backgroundppt.jpg"),
-        os.path.join(app.config.get("IMAGES_FOLDER", "images"), "backgroundppt.jpg"),
-        "backgroundppt.jpg",
     ]
     for candidate in candidates:
         if candidate and os.path.exists(candidate):
@@ -3384,13 +3497,155 @@ def _find_qalert_background_image():
     return None
 
 
+def _apply_qalert_animation(prs):
+    """
+    Add a click-triggered "Fade In" entrance animation to the QAlerts
+    heading + QAlerts body shapes on every slide (shape.name in
+    {"qalert_heading", "qalert_body"}). The drug title ("drug_title") and
+    the teaching-points panel ("drug_points") are intentionally left
+    unanimated -- they should just be visible immediately.
+
+    This writes the animation directly into each slide's <p:timing> XML,
+    so the "Animate" behavior is baked into the .pptx file itself and
+    works the same way regardless of which app opens it.
+    """
+    from pptx.oxml.ns import qn
+    from lxml import etree
+
+    ANIMATE_TARGET_NAMES = {"qalert_heading", "qalert_body"}
+
+    for slide in prs.slides:
+        target_shapes = [
+            shp for shp in slide.shapes
+            if getattr(shp, "name", "") in ANIMATE_TARGET_NAMES
+        ]
+        if not target_shapes:
+            continue
+
+        spTree = slide.shapes._spTree
+        cSld = spTree.getparent()
+
+        # Remove any pre-existing timing node so re-running this is safe.
+        existing_timing = cSld.find(qn("p:timing"))
+        if existing_timing is not None:
+            cSld.remove(existing_timing)
+
+        timing = etree.SubElement(cSld, qn("p:timing"))
+        tnLst = etree.SubElement(timing, qn("p:tnLst"))
+
+        root_par = etree.SubElement(tnLst, qn("p:par"))
+        root_ctn = etree.SubElement(root_par, qn("p:cTn"))
+        root_ctn.set("id", "1")
+        root_ctn.set("dur", "indefinite")
+        root_ctn.set("restart", "never")
+        root_ctn.set("nodeType", "tmRoot")
+
+        root_child_lst = etree.SubElement(root_ctn, qn("p:childTnLst"))
+
+        # One click-triggered sequence covering both target shapes so a
+        # single "Animate" click reveals the QAlerts heading + body together.
+        seq = etree.SubElement(root_child_lst, qn("p:seq"))
+        seq.set("concurrent", "1")
+        seq.set("nextAc", "seek")
+
+        seq_ctn = etree.SubElement(seq, qn("p:cTn"))
+        seq_ctn.set("id", "2")
+        seq_ctn.set("dur", "indefinite")
+        seq_ctn.set("nodeType", "mainSeq")
+
+        seq_child_lst = etree.SubElement(seq_ctn, qn("p:childTnLst"))
+
+        next_id = 3
+        for shp in target_shapes:
+            click_par = etree.SubElement(seq_child_lst, qn("p:par"))
+            click_ctn = etree.SubElement(click_par, qn("p:cTn"))
+            click_ctn.set("id", str(next_id)); next_id += 1
+            click_ctn.set("fill", "hold")
+            click_stlst = etree.SubElement(click_ctn, qn("p:stCondLst"))
+            click_cond = etree.SubElement(click_stlst, qn("p:cond"))
+            click_cond.set("delay", "0")
+
+            click_child_lst = etree.SubElement(click_ctn, qn("p:childTnLst"))
+            anim_par = etree.SubElement(click_child_lst, qn("p:par"))
+            anim_ctn = etree.SubElement(anim_par, qn("p:cTn"))
+            anim_ctn.set("id", str(next_id)); next_id += 1
+            anim_ctn.set("fill", "hold")
+
+            anim_stlst = etree.SubElement(anim_ctn, qn("p:stCondLst"))
+            anim_cond = etree.SubElement(anim_stlst, qn("p:cond"))
+            anim_cond.set("delay", "0")
+
+            anim_child_lst = etree.SubElement(anim_ctn, qn("p:childTnLst"))
+
+            set_effect_par = etree.SubElement(anim_child_lst, qn("p:par"))
+            set_effect_ctn = etree.SubElement(set_effect_par, qn("p:cTn"))
+            set_effect_ctn.set("id", str(next_id)); next_id += 1
+            set_effect_ctn.set("presetID", "10")     # Fade
+            set_effect_ctn.set("presetClass", "entr")
+            set_effect_ctn.set("presetSubtype", "0")
+            set_effect_ctn.set("fill", "hold")
+            set_effect_ctn.set("grpId", "0")
+            set_effect_ctn.set("nodeType", "clickEffect")
+
+            set_effect_stlst = etree.SubElement(set_effect_ctn, qn("p:stCondLst"))
+            set_effect_cond = etree.SubElement(set_effect_stlst, qn("p:cond"))
+            set_effect_cond.set("delay", "0")
+
+            set_effect_child_lst = etree.SubElement(set_effect_ctn, qn("p:childTnLst"))
+
+            set_node = etree.SubElement(set_effect_child_lst, qn("p:set"))
+            set_ctn = etree.SubElement(set_node, qn("p:cBhvr"))
+            set_ctn_cTn = etree.SubElement(set_ctn, qn("p:cTn"))
+            set_ctn_cTn.set("id", str(next_id)); next_id += 1
+            set_ctn_cTn.set("dur", "1")
+            set_ctn_cTn.set("fill", "hold")
+            set_stlst = etree.SubElement(set_ctn_cTn, qn("p:stCondLst"))
+            set_cond = etree.SubElement(set_stlst, qn("p:cond"))
+            set_cond.set("delay", "0")
+
+            set_tgt_lst = etree.SubElement(set_ctn, qn("p:tgtEl"))
+            set_spid = etree.SubElement(set_tgt_lst, qn("p:spid"))
+            set_spid.set("spid", str(shp.shape_id))
+
+            set_attr_name_lst = etree.SubElement(set_ctn, qn("p:attrNameLst"))
+            set_attr_name = etree.SubElement(set_attr_name_lst, qn("p:attrName"))
+            set_attr_name.text = "style.visibility"
+
+            set_to = etree.SubElement(set_node, qn("p:to"))
+            set_strval = etree.SubElement(set_to, qn("p:strVal"))
+            set_strval.set("val", "visible")
+
+            anim_effect = etree.SubElement(set_effect_child_lst, qn("p:animEffect"))
+            anim_effect.set("transition", "in")
+            anim_effect.set("filter", "fade")
+            anim_effect_cBhvr = etree.SubElement(anim_effect, qn("p:cBhvr"))
+            anim_effect_cTn = etree.SubElement(anim_effect_cBhvr, qn("p:cTn"))
+            anim_effect_cTn.set("id", str(next_id)); next_id += 1
+            anim_effect_cTn.set("dur", "500")
+            anim_effect_stlst = etree.SubElement(anim_effect_cTn, qn("p:stCondLst"))
+            anim_effect_cond = etree.SubElement(anim_effect_stlst, qn("p:cond"))
+            anim_effect_cond.set("delay", "0")
+
+            anim_effect_tgt = etree.SubElement(anim_effect_cBhvr, qn("p:tgtEl"))
+            anim_effect_spid = etree.SubElement(anim_effect_tgt, qn("p:spid"))
+            anim_effect_spid.set("spid", str(shp.shape_id))
+
+        # Build-list entry so PowerPoint's UI shows these as animated shapes.
+        build_lst = etree.SubElement(timing, qn("p:bldLst"))
+        for shp in target_shapes:
+            bld = etree.SubElement(build_lst, qn("p:bldP"))
+            bld.set("spid", str(shp.shape_id))
+            bld.set("grpId", "0")
+
+
 def create_qalert_template_presentation(drug_blocks, output_path):
     """
-    QAlert Template Generator
+    QAlerts Generator
     Creates one high-yield teaching PowerPoint slide per drug using:
-      - full-slide background image: backgroundppt.jpg
-      - large white drug title
-      - teal content panel with Drug Info Points and hyphen bullets
+      - full-slide background image: /static/qalerts.jpg
+      - bold white drug title
+      - rounded maroon teaching box (#7d071d)
+      - QAlerts section on the right with yellow heading and white alert text
     """
     if not PPTX_AVAILABLE:
         return False
@@ -3401,7 +3656,8 @@ def create_qalert_template_presentation(drug_blocks, output_path):
         prs.slide_height = Inches(7.5)
 
         WHITE = PptRGBColor(255, 255, 255)
-        TEAL = PptRGBColor(19, 145, 128)
+        YELLOW = PptRGBColor(255, 204, 0)
+        MAROON = PptRGBColor(125, 7, 29)  # #7d071d
         BLACK = PptRGBColor(0, 0, 0)
 
         bg_path = _find_qalert_background_image()
@@ -3409,35 +3665,94 @@ def create_qalert_template_presentation(drug_blocks, output_path):
         def clean_text(value):
             value = "" if value is None else str(value)
             value = value.replace("\x00", " ")
+            value = value.replace("\r\n", "\n").replace("\r", "\n")
             value = re.sub(r"\s+", " ", value).strip()
             return value
 
-        def title_size(text):
+        def fit_title_size(text):
             n = len(clean_text(text))
-            if n > 80:
-                return Pt(31)
-            if n > 58:
-                return Pt(38)
-            if n > 38:
-                return Pt(46)
-            return Pt(54)
+            if n > 90:
+                return Pt(20)
+            if n > 70:
+                return Pt(23)
+            if n > 50:
+                return Pt(26)
+            return Pt(30)
 
-        def info_size(points):
-            total = sum(len(clean_text(p)) for p in points)
-            count = len(points)
-            longest = max([len(clean_text(p)) for p in points] or [0])
-            if count > 8 or total > 900 or longest > 190:
-                return Pt(24)
-            if count > 6 or total > 650 or longest > 140:
-                return Pt(28)
-            if count > 4 or total > 420 or longest > 95:
-                return Pt(32)
-            return Pt(39)
+        def fit_points_size(points):
+            cleaned = [clean_text(p) for p in points if clean_text(p)]
+            total = sum(len(p) for p in cleaned)
+            longest = max([len(p) for p in cleaned] or [0])
+            count = len(cleaned)
+            if count >= 8 or total > 980 or longest > 210:
+                return Pt(15)
+            if count >= 6 or total > 760 or longest > 165:
+                return Pt(17)
+            if count >= 5 or total > 560 or longest > 125:
+                return Pt(19)
+            if count >= 4 or total > 380 or longest > 92:
+                return Pt(21)
+            return Pt(23)
+
+        def fit_alert_size(alerts):
+            cleaned = [clean_text(a) for a in alerts if clean_text(a)]
+            total = sum(len(a) for a in cleaned)
+            longest = max([len(a) for a in cleaned] or [0])
+            if total > 360 or longest > 180:
+                return Pt(20)
+            if total > 250 or longest > 125:
+                return Pt(23)
+            return Pt(26)
+
+        def apply_text_margins(tf, left=16, right=16, top=12, bottom=12, valign=MSO_VERTICAL_ANCHOR.MIDDLE):
+            tf.clear()
+            tf.word_wrap = True
+            tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+            tf.vertical_anchor = valign
+            tf.margin_left = Pt(left)
+            tf.margin_right = Pt(right)
+            tf.margin_top = Pt(top)
+            tf.margin_bottom = Pt(bottom)
+
+        def add_bold_prefix_paragraph(tf, text, font_size, bullet=True, first=False):
+            p = tf.paragraphs[0] if first else tf.add_paragraph()
+            p.alignment = PP_ALIGN.LEFT
+            p.space_after = Pt(18 if font_size.pt >= 21 else 11)
+            p.line_spacing = 1.05
+
+            cleaned = clean_text(text)
+            prefix = "• " if bullet else ""
+
+            if ":" in cleaned:
+                lead, rest = cleaned.split(":", 1)
+                run = p.add_run()
+                run.text = f"{prefix}{lead.strip()}:"
+                run.font.name = "Arial"
+                run.font.size = font_size
+                run.font.bold = True
+                run.font.color.rgb = WHITE
+
+                run2 = p.add_run()
+                run2.text = f" {rest.strip()}" if rest.strip() else ""
+                run2.font.name = "Arial"
+                run2.font.size = font_size
+                run2.font.bold = False
+                run2.font.color.rgb = WHITE
+            else:
+                run = p.add_run()
+                run.text = f"{prefix}{cleaned}"
+                run.font.name = "Arial"
+                run.font.size = font_size
+                run.font.bold = False
+                run.font.color.rgb = WHITE
+            return p
 
         for block in drug_blocks:
             drug_name = clean_text(block.get("drug_name", ""))
             points = [clean_text(p) for p in block.get("points", []) if clean_text(p)]
-            if not drug_name or not points:
+            alerts = [clean_text(a) for a in block.get("alerts", []) if clean_text(a)]
+
+            if not drug_name or (not points and not alerts):
                 continue
 
             slide = prs.slides.add_slide(prs.slide_layouts[6])
@@ -3450,67 +3765,81 @@ def create_qalert_template_presentation(drug_blocks, output_path):
                 bg.fill.fore_color.rgb = BLACK
                 bg.line.fill.background()
 
-            title_box = slide.shapes.add_textbox(Inches(1.72), Inches(1.28), Inches(10.5), Inches(0.82))
+            # Drug title: bold, clean, and automatically shrinks if needed.
+            title_box = slide.shapes.add_textbox(Inches(0.48), Inches(0.48), Inches(6.8), Inches(0.55))
+            title_box.name = "drug_title"  # excluded from QAlert animation
             title_tf = title_box.text_frame
-            title_tf.clear()
-            title_tf.word_wrap = True
-            title_tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
-            title_tf.margin_left = Pt(0)
-            title_tf.margin_right = Pt(0)
-            title_tf.margin_top = Pt(0)
-            title_tf.margin_bottom = Pt(0)
-
+            apply_text_margins(title_tf, 0, 0, 0, 0, MSO_VERTICAL_ANCHOR.MIDDLE)
             title_p = title_tf.paragraphs[0]
             title_p.text = drug_name
             title_p.alignment = PP_ALIGN.LEFT
             title_p.font.name = "Arial"
-            title_p.font.size = title_size(drug_name)
-            title_p.font.bold = False
+            title_p.font.size = fit_title_size(drug_name)
+            title_p.font.bold = True
             title_p.font.color.rgb = WHITE
 
+            # Main teaching box: rounded maroon panel.
             info_panel = slide.shapes.add_shape(
-                MSO_SHAPE.RECTANGLE,
-                Inches(0.92),
-                Inches(2.94),
-                Inches(7.22),
-                Inches(3.98),
+                MSO_SHAPE.ROUNDED_RECTANGLE,
+                Inches(0.38),
+                Inches(1.34),
+                Inches(6.30),
+                Inches(5.30),
             )
+            info_panel.name = "drug_points"  # excluded from QAlert animation
             info_panel.fill.solid()
-            info_panel.fill.fore_color.rgb = TEAL
+            info_panel.fill.fore_color.rgb = MAROON
             info_panel.line.fill.background()
+            info_panel.adjustments[0] = 0.08
 
             tf = info_panel.text_frame
-            tf.clear()
-            tf.word_wrap = True
-            tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
-            tf.vertical_anchor = MSO_VERTICAL_ANCHOR.TOP
-            tf.margin_left = Inches(0.42)
-            tf.margin_right = Inches(0.32)
-            tf.margin_top = Inches(0.34)
-            tf.margin_bottom = Inches(0.24)
+            apply_text_margins(tf, 18, 18, 16, 14, MSO_VERTICAL_ANCHOR.MIDDLE)
 
-            heading = tf.paragraphs[0]
-            heading.text = "Drug Info Points"
-            heading.alignment = PP_ALIGN.LEFT
-            heading.space_after = Pt(44)
-            heading.font.name = "Arial"
-            heading.font.size = Pt(41)
-            heading.font.bold = False
-            heading.font.color.rgb = WHITE
+            point_font = fit_points_size(points)
+            if points:
+                add_bold_prefix_paragraph(tf, points[0], point_font, bullet=True, first=True)
+                for point in points[1:]:
+                    add_bold_prefix_paragraph(tf, point, point_font, bullet=True, first=False)
+            else:
+                p = tf.paragraphs[0]
+                p.text = ""
 
-            point_font = info_size(points)
-            for point in points:
-                p = tf.add_paragraph()
-                p.text = f"- {point}"
+            # Right-side QAlerts section.
+            alert_title_box = slide.shapes.add_textbox(Inches(7.42), Inches(1.76), Inches(3.9), Inches(0.52))
+            alert_title_box.name = "qalert_heading"  # animate target
+            alert_title_tf = alert_title_box.text_frame
+            apply_text_margins(alert_title_tf, 0, 0, 0, 0, MSO_VERTICAL_ANCHOR.MIDDLE)
+            alert_title_p = alert_title_tf.paragraphs[0]
+            alert_title_p.text = "QAlerts!"
+            alert_title_p.alignment = PP_ALIGN.LEFT
+            alert_title_p.font.name = "Arial"
+            alert_title_p.font.size = Pt(30)
+            alert_title_p.font.bold = True
+            alert_title_p.font.color.rgb = YELLOW
+
+            alert_body_box = slide.shapes.add_textbox(Inches(7.42), Inches(2.35), Inches(5.20), Inches(2.65))
+            alert_body_box.name = "qalert_body"  # animate target
+            alert_body_tf = alert_body_box.text_frame
+            apply_text_margins(alert_body_tf, 0, 0, 0, 0, MSO_VERTICAL_ANCHOR.TOP)
+            alert_font = fit_alert_size(alerts)
+            alert_lines = alerts if alerts else [""]
+            for idx, alert in enumerate(alert_lines):
+                p = alert_body_tf.paragraphs[0] if idx == 0 else alert_body_tf.add_paragraph()
+                p.text = alert
                 p.alignment = PP_ALIGN.LEFT
-                p.space_after = Pt(3)
+                p.space_after = Pt(9)
                 p.font.name = "Arial"
-                p.font.size = point_font
+                p.font.size = alert_font
                 p.font.bold = False
                 p.font.color.rgb = WHITE
 
         if len(prs.slides) == 0:
             return False
+
+        # Apply click-triggered entrance animation ONLY to the QAlerts
+        # heading + body on every slide — never the drug title or the
+        # teaching-points panel.
+        _apply_qalert_animation(prs)
 
         prs.save(output_path)
         return True
@@ -3520,7 +3849,6 @@ def create_qalert_template_presentation(drug_blocks, output_path):
         print(f"Error creating QAlert template presentation: {e}")
         print(traceback.format_exc())
         return False
-
 
 def create_ppt_template_presentation(mcqs, output_path):
     if not PPTX_AVAILABLE:
@@ -4026,7 +4354,7 @@ def upload_image():
         filepath = os.path.join(app.config["IMAGES_FOLDER"], filename)
         file.save(filepath)
         return jsonify({
-            "message": "✅ Image uploaded successfully", 
+            "message": "✅ Image uploaded successfully",
             "filename": filename,
             "image_url": f"/images/{filename}"
         })
@@ -4342,7 +4670,7 @@ def convert_docx_to_html_pixel_perfect(input_path: str, output_path: str) -> str
             f.write(html)
 
         return html
-    
+   
 @app.route("/generated-assets/<asset_folder>/<filename>")
 def generated_assets(asset_folder, filename):
     safe_folder = secure_filename(asset_folder)
@@ -4563,7 +4891,7 @@ Rules:
             _set(20, "Parsing QAlert drug info blocks", "~2 seconds")
             drug_blocks = parse_qalert_drug_info_blocks(file_content)
             if not drug_blocks:
-                return jsonify({"error": "No QAlert drug info blocks were found. Use: 1. Drug Name, then A) info point, B) info point, C) info point."}), 400
+                return jsonify({"error": "No QAlert blocks were found. Use: Drug Name, explanation lines, QAlerts, then the QAlerts explanation."}), 400
             _set(60, "Building QAlert teaching presentation", "~5 seconds")
             output_filename = f"qalert_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pptx"
             output_path = os.path.join(app.config["GENERATED_FOLDER"], output_filename)
@@ -4571,7 +4899,7 @@ Rules:
             _set(100, "Done", "Complete")
             if success:
                 return jsonify({"message": "✅ QAlert PowerPoint generated successfully", "download_url": f"/download/{output_filename}", "job_id": job_id})
-            return jsonify({"error": "Failed to generate QAlert PowerPoint. Make sure python-pptx is installed and backgroundppt.jpg is available."}), 500
+            return jsonify({"error": "Failed to generate QAlerts PowerPoint. Make sure python-pptx is installed and static/qalerts.jpg is available."}), 500
 
         # ── MCQ EXTRACTION ─────────────────────────────────────────────────
         _set(15, "Normalizing MCQs with GPT", "~20 seconds")
